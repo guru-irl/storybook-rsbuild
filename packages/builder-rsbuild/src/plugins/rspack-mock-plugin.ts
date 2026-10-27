@@ -1,5 +1,6 @@
 import type { Rspack } from '@rsbuild/core'
-import { dirname, isAbsolute } from 'node:path'
+import { readFileSync, realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   babelParser,
@@ -11,6 +12,49 @@ import {
 } from 'storybook/internal/mocking-utils'
 
 const PLUGIN_NAME = 'RspackMockPlugin'
+
+const RELATIVE_REQUEST = /^\.\.?(?:[/\\]|$)/
+
+/**
+ * Paths that a relative or absolute request can join to and still resolve to `path`: the path and
+ * each prefix that ends before a `/` or a `.`, because resolution adds extensions, `index` files
+ * and package entry points.
+ */
+function getRequestPaths(path: string): string[] {
+  const paths = [path]
+  for (let index = 1; index < path.length; index++) {
+    if (path[index] === '.' || path[index] === '/') {
+      paths.push(path.slice(0, index))
+    }
+  }
+  return paths
+}
+
+/** The `name` of every package.json from `dir` up to the file system root. */
+function getPackageNames(dir: string): string[] {
+  const names: string[] = []
+  for (let current = dir; ; current = dirname(current)) {
+    try {
+      const { name } = JSON.parse(
+        readFileSync(join(current, 'package.json'), 'utf-8'),
+      )
+      if (typeof name === 'string') {
+        names.push(name)
+      }
+    } catch {
+      // No package.json, or not one we can read.
+    }
+    if (dirname(current) === current) {
+      return names
+    }
+  }
+}
+
+/** The package a bare request points into: `@scope/name` or `name`. */
+function getPackageName(request: string): string {
+  const [first, second] = request.split('/')
+  return first.startsWith('@') && second ? `${first}/${second}` : first
+}
 
 /**
  * Normalize file paths to use forward slashes consistently across all platforms.
@@ -42,6 +86,9 @@ export class RspackMockPlugin {
   private readonly options: RspackMockPluginOptions
   private mockMap: Map<string, ResolvedMock> = new Map()
   private candidateSpecifiers: Set<string> = new Set()
+  private mockRequestPaths: Set<string> = new Set()
+  private mockPackageNames: Set<string> = new Set()
+  private realDirectories: Map<string, string> = new Map()
   private lastPreviewMtime: number | undefined
 
   constructor(options: RspackMockPluginOptions) {
@@ -80,6 +127,15 @@ export class RspackMockPlugin {
       // (builder-webpack5 has the same bug: webpack-mock-plugin.ts:86 on `next`.)
       // See https://github.com/rstackjs/storybook-rsbuild/pull/524#discussion_r3688976092
       this.candidateSpecifiers = new Set(resolved.map((mock) => mock.path))
+      this.mockRequestPaths = new Set(
+        resolved.flatMap((mock) =>
+          getRequestPaths(normalizePath(resolve(mock.absolutePath))),
+        ),
+      )
+      this.mockPackageNames = new Set(
+        resolved.flatMap((mock) => getPackageNames(dirname(mock.absolutePath))),
+      )
+      this.realDirectories.clear()
       this.lastPreviewMtime = mTimePreviewConfig
 
       if (resolved.length > 0) {
@@ -99,6 +155,13 @@ export class RspackMockPlugin {
         // otherwise every request in the module graph pays for a `require.resolve`-style
         // lookup for no benefit. See https://github.com/storybookjs/storybook/issues/33778.
         if (this.mockMap.size === 0) {
+          return
+        }
+        // The plugin also calls back after resolution, when a new request has no effect.
+        if (resource.createData?.resource) {
+          return
+        }
+        if (!this.canResolveToMock(resource.request, resource.context)) {
           return
         }
 
@@ -139,6 +202,47 @@ export class RspackMockPlugin {
         }
       }
     })
+  }
+
+  /**
+   * A cheap check that runs before `require.resolve`, which throws several times for most
+   * requests. Returns false only for requests that cannot resolve to a mocked module: a relative
+   * or absolute request resolves at or below the path it joins to, and a bare request reaches a
+   * file through the package it names.
+   */
+  private canResolveToMock(request: string, context: string): boolean {
+    if (RELATIVE_REQUEST.test(request) || isAbsolute(request)) {
+      // `require.resolve` joins the request to the context and then follows symlinks, unless Node
+      // runs with `--preserve-symlinks`, so accept the joined path both as written and with
+      // symlinks in its directory followed.
+      const path = resolve(context, request)
+      return (
+        this.mockRequestPaths.has(normalizePath(path)) ||
+        this.mockRequestPaths.has(
+          normalizePath(
+            join(this.getRealDirectory(dirname(path)), basename(path)),
+          ),
+        )
+      )
+    }
+    return (
+      this.candidateSpecifiers.has(request) ||
+      this.mockPackageNames.has(getPackageName(request))
+    )
+  }
+
+  /** The real path of a directory, cached because many requests share a directory. */
+  private getRealDirectory(directory: string): string {
+    let realDirectory = this.realDirectories.get(directory)
+    if (realDirectory === undefined) {
+      try {
+        realDirectory = realpathSync(directory)
+      } catch {
+        realDirectory = directory
+      }
+      this.realDirectories.set(directory, realDirectory)
+    }
+    return realDirectory
   }
 
   private getPreviewConfigMtime(compiler: Rspack.Compiler): number | undefined {

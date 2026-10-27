@@ -1,6 +1,14 @@
 import type { Rspack } from '@rsbuild/core'
 import { describe, expect, it } from '@rstest/core'
-import { resolve } from 'node:path'
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, relative, resolve } from 'node:path'
 import { resolve as resolvePosix } from 'pathe'
 import { RspackMockPlugin } from '../../src/plugins/rspack-mock-plugin'
 
@@ -15,6 +23,7 @@ const fixtureDir = resolve(__dirname, '../fixtures/mock-plugin')
 interface Resource {
   request: string
   context: string
+  createData?: { resource?: string }
 }
 
 type InfrastructureLogger = ReturnType<
@@ -125,6 +134,102 @@ describe('RspackMockPlugin', () => {
 
     expect(resource.request).toBe('./not-a-real-module')
     expect(debugMessages).toEqual([])
+  })
+
+  it('skips requests that cannot resolve to a mocked module', () => {
+    const { replaceResource, debugMessages } = applyPlugin(
+      'preview-with-mock.ts',
+    )
+
+    for (const request of ['./not-a-real-module', '@/not-a-real-alias']) {
+      const resource = { request, context: fixtureDir }
+
+      replaceResource(resource)
+
+      expect(resource.request).toBe(request)
+    }
+    expect(debugMessages).toEqual([])
+  })
+
+  it('mocks requests only before they are resolved', () => {
+    const { replaceResource } = applyPlugin('preview-with-mock.ts')
+    // Rspack calls the plugin again after resolution, with `createData.resource` set.
+    const before = {
+      request: './mocked-module',
+      context: fixtureDir,
+      createData: {},
+    }
+    const after = {
+      request: './mocked-module',
+      context: fixtureDir,
+      createData: { resource: resolve(fixtureDir, 'mocked-module.js') },
+    }
+
+    replaceResource(before)
+    replaceResource(after)
+
+    expect(before.request).toBe(
+      resolvePosix(fixtureDir, '__mocks__/mocked-module.js'),
+    )
+    expect(after.request).toBe('./mocked-module')
+  })
+
+  it('still mocks directory imports, package links and symlinked directories', () => {
+    const { replaceResource } = applyPlugin('preview-with-mock.ts')
+    const directoryResource = { request: './mocked-dir', context: fixtureDir }
+
+    replaceResource(directoryResource)
+
+    expect(directoryResource.request).toBe(
+      resolvePosix(fixtureDir, 'mocked-dir/__mocks__/index.js'),
+    )
+
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), 'rspack-mock-plugin-')),
+    )
+    const modules = join(root, 'node_modules')
+    const link = join(modules, 'mock-plugin-fixture')
+    try {
+      mkdirSync(modules)
+      symlinkSync(fixtureDir, link, 'junction')
+
+      const packageResource = {
+        request: 'mock-plugin-fixture/mocked-module',
+        context: root,
+      }
+      replaceResource(packageResource)
+      expect(packageResource.request).toBe(
+        resolvePosix(fixtureDir, '__mocks__/mocked-module.js'),
+      )
+
+      const linkedResource = { request: './mocked-module', context: link }
+      replaceResource(linkedResource)
+      expect(linkedResource.request).toBe(
+        resolvePosix(fixtureDir, '__mocks__/mocked-module.js'),
+      )
+
+      // `require.resolve` joins a request to its context before following symlinks.
+      for (const resource of [
+        {
+          request: `${relative(link, fixtureDir)}/mocked-module`,
+          context: link,
+        },
+        { request: join(link, 'mocked-module'), context: root },
+        {
+          request: './node_modules/mock-plugin-fixture/mocked-module',
+          context: root,
+        },
+      ]) {
+        replaceResource(resource)
+        expect(resource.request).toBe(
+          resolvePosix(fixtureDir, '__mocks__/mocked-module.js'),
+        )
+      }
+    } finally {
+      // Remove the link first, so the recursive removal never reaches the fixtures it points to.
+      rmSync(link, { force: true })
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   // `pathe` is a real dependency, so getIsExternal reports it as external and it takes the
