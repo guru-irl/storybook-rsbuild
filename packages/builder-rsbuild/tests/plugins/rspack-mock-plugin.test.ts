@@ -1,16 +1,24 @@
 import type { Rspack } from '@rsbuild/core'
-import { describe, expect, it } from '@rstest/core'
+import { describe, expect, it, rs } from '@rstest/core'
 import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, relative, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { resolve as resolvePosix } from 'pathe'
+import {
+  getIsExternal,
+  resolveExternalModule,
+  resolveWithExtensions,
+} from 'storybook/internal/mocking-utils'
 import { RspackMockPlugin } from '../../src/plugins/rspack-mock-plugin'
+
+rs.mock('storybook/internal/mocking-utils', { spy: true })
 
 // `extractMockCalls` calls `telemetry('mocking', ...)` whenever it finds mocks, but nothing
 // leaves this process: `telemetry()` gates on `globalThis.SB_TELEMETRY_STATE`, which only the
@@ -35,12 +43,12 @@ type InfrastructureLogger = ReturnType<
  * callback given to NormalModuleReplacementPlugin, a trigger for the mock-map refresh that
  * normally runs on beforeRun, and the debug messages the plugin logged.
  *
- * `debugMessages` is what distinguishes an early return from a completed resolution: the plugin
- * only logs on a failed resolve, so an unresolvable request that produces no message proves the
- * callback bailed out before attempting resolution at all.
+ * `debugMessages` captures failed resolutions. Spies on the resolution utilities verify that
+ * unrelated requests never attempt resolution.
  */
 function applyPlugin(
-  previewConfig: 'preview-with-mock.ts' | 'preview-without-mock.ts',
+  previewConfig = 'preview-with-mock.ts',
+  context = fixtureDir,
 ) {
   const infoMessages: string[] = []
   const debugMessages: string[] = []
@@ -52,7 +60,7 @@ function applyPlugin(
   let previewMtime = 1_000
 
   const compilerStub = {
-    context: fixtureDir,
+    context,
     inputFileSystem: {
       statSync: () => ({ mtime: new Date(previewMtime) }),
     } as unknown as Rspack.Compiler['inputFileSystem'],
@@ -88,7 +96,7 @@ function applyPlugin(
   const compiler = compilerStub as unknown as Rspack.Compiler
 
   new RspackMockPlugin({
-    previewConfigPath: resolve(fixtureDir, previewConfig),
+    previewConfigPath: resolve(context, previewConfig),
   }).apply(compiler)
 
   if (!replaceResource || !refreshMocks) {
@@ -141,7 +149,13 @@ describe('RspackMockPlugin', () => {
       'preview-with-mock.ts',
     )
 
-    for (const request of ['./not-a-real-module', '@/not-a-real-alias']) {
+    rs.clearAllMocks()
+
+    for (const request of [
+      './not-a-real-module',
+      '@/not-a-real-alias',
+      'react',
+    ]) {
       const resource = { request, context: fixtureDir }
 
       replaceResource(resource)
@@ -149,6 +163,14 @@ describe('RspackMockPlugin', () => {
       expect(resource.request).toBe(request)
     }
     expect(debugMessages).toEqual([])
+    expect(getIsExternal).not.toHaveBeenCalled()
+    expect(resolveWithExtensions).not.toHaveBeenCalled()
+    expect(resolveExternalModule).not.toHaveBeenCalled()
+
+    // Control: a mocked request does reach the spied resolver.
+    replaceResource({ request: './mocked-module', context: fixtureDir })
+
+    expect(resolveWithExtensions).toHaveBeenCalled()
   })
 
   it('mocks requests only before they are resolved', () => {
@@ -232,6 +254,39 @@ describe('RspackMockPlugin', () => {
     }
   })
 
+  it('refreshes directory links when the preview is unchanged', () => {
+    const { replaceResource, recompile } = applyPlugin('preview-with-mock.ts')
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), 'rspack-mock-plugin-relink-')),
+    )
+    const unmocked = join(root, 'unmocked')
+    const link = join(root, 'relinked')
+    try {
+      mkdirSync(unmocked)
+      symlinkSync(unmocked, link, 'junction')
+      const before = { request: './mocked-module', context: link }
+
+      replaceResource(before)
+
+      expect(before.request).toBe('./mocked-module')
+
+      rmSync(link)
+      symlinkSync(fixtureDir, link, 'junction')
+      recompile()
+      const after = { request: './mocked-module', context: link }
+
+      replaceResource(after)
+
+      expect(after.request).toBe(
+        resolvePosix(fixtureDir, '__mocks__/mocked-module.js'),
+      )
+    } finally {
+      // Remove the link first, so recursive removal cannot reach the committed fixtures.
+      rmSync(link, { force: true })
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   // `pathe` is a real dependency, so getIsExternal reports it as external and it takes the
   // candidateSpecifiers path. This pins the outcome, not the shortcut: skipping the resolve is an
   // optimisation, so removing it would leave this request untouched either way.
@@ -253,6 +308,39 @@ describe('RspackMockPlugin', () => {
     expect(resource.request).toBe(
       resolvePosix(fixtureDir, '__mocks__/mocked-module.js'),
     )
+  })
+
+  it('redirects an external package to its mock', () => {
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), 'rspack-mock-plugin-external-')),
+    )
+    try {
+      const files = {
+        'package.json': JSON.stringify({ name: 'mock-plugin-project' }),
+        'preview.ts': [
+          "import { sb } from 'storybook/test'",
+          "sb.mock('ext-pkg')",
+        ].join('\n'),
+        'node_modules/ext-pkg/package.json': JSON.stringify({
+          name: 'ext-pkg',
+        }),
+        'node_modules/ext-pkg/index.js': "export const value = 'real'",
+        '__mocks__/ext-pkg.js': "export const value = 'mocked'",
+      }
+      for (const [file, content] of Object.entries(files)) {
+        const path = join(root, file)
+        mkdirSync(dirname(path), { recursive: true })
+        writeFileSync(path, content)
+      }
+      const { replaceResource } = applyPlugin(join(root, 'preview.ts'), root)
+      const resource = { request: 'ext-pkg', context: root }
+
+      replaceResource(resource)
+
+      expect(resource.request).toBe(resolvePosix(root, '__mocks__/ext-pkg.js'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   describe('mock map caching', () => {
