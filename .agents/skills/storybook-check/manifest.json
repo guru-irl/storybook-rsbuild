@@ -8,6 +8,8 @@
       "local": "packages/builder-rsbuild/src/plugins/rspack-mock-plugin.ts",
       "intentionalDivergences": [
         "normalizePath() applied to mockMap keys and resolved requests — pathe and require.resolve disagree on Windows path separators",
+        "normalizePath() also applied to canResolveToMock's joined paths and to the mock paths given to getRequestPaths, which therefore checks only '/' and '.' (no sep) and skips a '.' right after '/'; same reason",
+        "`resource.createData?.resource` keeps the optional chain: Rspack calls the NormalModuleReplacementPlugin callback before resolution without createData, where webpack passes `{}`",
         "optional `configDir` plugin option not present upstream",
         "uses compiler.getInfrastructureLogger instead of storybook/internal/node-logger",
         "passes compiler directly to NormalModuleReplacementPlugin.apply; the redundant `as any` assertion is rejected by Rstack 0.7.4 typed lint"
